@@ -1,0 +1,3 @@
+*.beam
+*~
+ebin/erserve_pool.app

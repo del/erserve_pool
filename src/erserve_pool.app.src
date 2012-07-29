@@ -1,0 +1,12 @@
+{ application
+, erserve_pool
+, [ {description, "Connection pooling for erserve"}
+  , {vsn, "1.0"}
+  , {registered, []}
+  , {applications, [ kernel
+                   , stdlib
+                   , erserve
+                   ]}
+  , {mod, { erserve_pool, [] }}
+  , {env, []}
+ ]}.
