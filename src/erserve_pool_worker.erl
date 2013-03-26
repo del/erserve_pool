@@ -109,15 +109,17 @@ init({Name, Size, Opts}) ->
                 , waiting     = queue:new()
                 , timer       = maybe_close_unused_timer(Opts)
                 },
+  lager:debug( "erserve_pool | initialising pool, name ~p size ~p keep_alive ~p"
+             , [Id, Size, proplists:get_value(keep_alive, Opts)] ),
   {ok, State}.
 
 maybe_close_unused_timer(Opts) ->
   case proplists:get_value(keep_alive, Opts) of
     true ->
-      {ok, TRef} = timer:send_interval(60000, close_unused),
-      TRef;
+      undefined;
     _    ->
-      undefined
+      {ok, TRef} = timer:send_interval(60000, close_unused),
+      TRef
   end.
 
 %% Requestor wants a connection. When available then immediately return,
