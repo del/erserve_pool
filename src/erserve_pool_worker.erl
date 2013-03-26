@@ -65,8 +65,8 @@ get_connection(Pool, Timeout) ->
     gen_server:call(Pool, get_connection, Timeout)
   catch
     ErrType:Error ->
-      io:format("Error ~p~n~p~n~p~n",
-                [ErrType, Error, erlang:get_stacktrace()]),
+      lager:warn( "erserve_pool | failed to get connection ~p ~p"
+                , [ErrType, Error] ),
       gen_server:cast(Pool, {cancel_wait, self()}),
       {error, timeout}
   end.
@@ -177,11 +177,15 @@ handle_info(close_unused, State)                     ->
                                        Time < Old
                                    end, State#state.connections),
   [ erserve:close(Conn) || {Conn, _} <- Unused ],
+  lager:debug( "erserve_pool | closed ~p unused connections"
+             , [erlang:length(Unused)] ),
   {noreply, State#state{connections=Used}};
 %% Requestor we are monitoring went down. Kill the associated connection,
 %% as it might be in an unknown state.
 handle_info({'DOWN', Monitor, process, _Pid, _Info},
             State=#state{monitors = Monitors})       ->
+  lager:warn( "erserve_pool | process holding connection crashed"
+              "killing connection" ),
   case lists:keytake(Monitor, 2, Monitors) of
     {value, {Conn, Monitor}, Monitors2} ->
       erserve:close(Conn),
@@ -191,6 +195,7 @@ handle_info({'DOWN', Monitor, process, _Pid, _Info},
   end;
 %% Connection closed; perform cleanup of monitoring
 handle_info({'EXIT', ConnectionPid, _Reason}, State) ->
+  lager:debug("erserve_pool | connection closed, clean up monitoring"),
   #state{ connections = Connections
         , monitors    = Monitors} = State,
   Connections2 = proplists:delete(ConnectionPid, Connections),
@@ -207,6 +212,7 @@ handle_info(Info, State)                             ->
   {stop, {unsupported_info, Info}, State}.
 
 terminate(_Reason, State) ->
+  lager:debug("erserve_pool | pool terminating"),
   case State#state.timer of
     undefined -> ok;
     TRef      -> timer:cancel(TRef)
@@ -219,6 +225,7 @@ code_change(_OldVsn, State, _Extra) ->
 
 %%%_* Internal functions -------------------------------------------------------
 connect(Opts) ->
+  lager:debug("erserve_pool | initialising new worker"),
   Host = proplists:get_value(host, Opts),
   Port = proplists:get_value(port, Opts),
   Conn = case {Host, Port} of
@@ -227,8 +234,12 @@ connect(Opts) ->
            {_SomeHost, _SomePort} -> erserve:open(Host, Port)
          end,
   case run_init_commands(Conn, Opts) of
-    ok    -> {ok, Conn};
-    Error -> Error
+    ok    ->
+      lager:debug("erserve_pool | new worker successfully initialised"),
+      {ok, Conn};
+    Error ->
+      lager:warn("erserve_pool | init command failed ~p", [Error]),
+      Error
   end.
 
 run_init_commands(Conn, Opts) ->
