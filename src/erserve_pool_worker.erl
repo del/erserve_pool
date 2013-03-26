@@ -101,16 +101,24 @@ init({Name, Size, Opts}) ->
          _Name     -> Name
        end,
   {ok, Conn} = connect(Opts),
-  {ok, TRef} = timer:send_interval(60000, close_unused),
   State = #state{ id          = Id
                 , size        = Size
                 , opts        = Opts
                 , connections = [ {Conn, now_secs()} ]
                 , monitors    = []
                 , waiting     = queue:new()
-                , timer       = TRef
+                , timer       = maybe_close_unused_timer(Opts)
                 },
   {ok, State}.
+
+maybe_close_unused_timer(Opts) ->
+  case proplists:get_value(keep_alive, Opts) of
+    true ->
+      {ok, TRef} = timer:send_interval(60000, close_unused),
+      TRef;
+    _    ->
+      undefined
+  end.
 
 %% Requestor wants a connection. When available then immediately return,
 %% otherwise add to the waiting queue.
@@ -197,7 +205,10 @@ handle_info(Info, State)                             ->
   {stop, {unsupported_info, Info}, State}.
 
 terminate(_Reason, State) ->
-  timer:cancel(State#state.timer),
+  case State#state.timer of
+    undefined -> ok;
+    TRef      -> timer:cancel(TRef)
+  end,
   ok.
 
 code_change(_OldVsn, State, _Extra) ->
