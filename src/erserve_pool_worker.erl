@@ -65,8 +65,8 @@ get_connection(Pool, Timeout) ->
     gen_server:call(Pool, get_connection, Timeout)
   catch
     ErrType:Error ->
-      lager:warn( "erserve_pool | failed to get connection ~p ~p"
-                , [ErrType, Error] ),
+      lager:warning( "erserve_pool | failed to get connection ~p ~p"
+                   , [ErrType, Error] ),
       gen_server:cast(Pool, {cancel_wait, self()}),
       {error, timeout}
   end.
@@ -184,8 +184,8 @@ handle_info(close_unused, State)                     ->
 %% as it might be in an unknown state.
 handle_info({'DOWN', Monitor, process, _Pid, _Info},
             State=#state{monitors = Monitors})       ->
-  lager:warn( "erserve_pool | process holding connection crashed"
-              "killing connection" ),
+  lager:warning( "erserve_pool | process holding connection crashed, "
+                 "killing connection" ),
   case lists:keytake(Monitor, 2, Monitors) of
     {value, {Conn, Monitor}, Monitors2} ->
       erserve:close(Conn),
@@ -238,7 +238,7 @@ connect(Opts) ->
       lager:debug("erserve_pool | new worker successfully initialised"),
       {ok, Conn};
     Error ->
-      lager:warn("erserve_pool | init command failed ~p", [Error]),
+      lager:warning("erserve_pool | init command failed ~p", [Error]),
       Error
   end.
 
