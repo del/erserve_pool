@@ -15,7 +15,7 @@
         , get_connection/2
         , get_pid/1
         , return_connection/2
-        , start_link/3
+        , start_link/2
         , stop/1
         ]).
 
@@ -29,29 +29,41 @@
         ]).
 
 
-%%%_* Types --------------------------------------------------------------------
--type seconds() :: pos_integer().
-
-
 %%%_* Local definitions --------------------------------------------------------
--record(state, { id          :: pid() | string()
-               , size        :: pos_integer()
-               , connections :: { erserve:connection(), seconds() }
-               , monitors    :: [ reference() ]
-               , waiting
-               , opts
-               , timer
+-record(state, { id             :: pid() | string()
+               , min_size       :: pos_integer()
+               , max_size       :: pos_integer()
+               , max_queue_size :: pos_integer() | inf
+               , connections    :: [ tagged_connection() ]
+               , monitors       :: [ {tagged_connection(), reference()} ]
+               , waiting        :: [ pid() ]
+               , opts           :: options()
+               , timer          :: timer:tref()
                }).
 
 
+%%%_* Types --------------------------------------------------------------------
+-type options()           :: orddict:orddict().
+-type seconds()           :: pos_integer().
+-type state()             :: #state{}.
+-type tagged_connection() :: { erserve:connection(), seconds() }.
+
+-export_type([ options/0
+             ]).
+
+
 %%%_* External API -------------------------------------------------------------
-start_link(Name, Size, Opts) ->
-  gen_server:start_link({local, Name}, ?MODULE, {Name, Size, Opts}, []).
+-spec start_link(erserve_pool:name(), options()) ->
+                    {ok, pid()}
+                  | {error, {already_started, pid()}}
+                  | {error, Reason :: term()}.
+start_link(Name, Opts) ->
+  gen_server:start_link({local, Name}, ?MODULE, {Name, Opts}, []).
 
 %%%-----------------------------------------------------------------------------
 %%% @doc Get a connection, waiting at most 10 seconds before giving up.
 %%%-----------------------------------------------------------------------------
--spec get_connection(erserve_pool:name()) -> erserve:connection().
+-spec get_connection(erserve_pool:name()) -> {ok, erserve:connection()} | error.
 get_connection(Pool) ->
   get_connection(Pool, 10000).
 
@@ -59,7 +71,7 @@ get_connection(Pool) ->
 %%% @doc Get a connection, waiting at most Timeout seconds before giving up.
 %%%-----------------------------------------------------------------------------
 -spec get_connection(erserve_pool:name(), pos_integer()) ->
-                        erserve:connection().
+                        {ok, erserve:connection()} | error.
 get_connection(Pool, Timeout) ->
   try
     gen_server:call(Pool, get_connection, Timeout)
@@ -94,27 +106,48 @@ stop(Pool) ->
 
 
 %%%_* gen_server callbacks -----------------------------------------------------
-init({Name, Size, Opts}) ->
+-spec init({erserve_pool:name(), options()}) -> {ok, state()}.
+init({Name, Opts}) ->
   process_flag(trap_exit, true),
-  Id = case Name of
-         undefined -> self();
-         _Name     -> Name
-       end,
-  {ok, Conn} = connect(Opts),
-  State = #state{ id          = Id
-                , size        = Size
-                , opts        = Opts
-                , connections = [ {Conn, now_secs()} ]
-                , monitors    = []
-                , waiting     = queue:new()
-                , timer       = maybe_close_unused_timer(Opts)
+  Id           = case Name of
+                   undefined -> self();
+                   _Name     -> Name
+                 end,
+  assert_config(Opts),
+  MinSize      = orddict:fetch(min_size,       Opts),
+  MaxSize      = orddict:fetch(max_size,       Opts),
+  MaxQueueSize = orddict:fetch(max_queue_size, Opts),
+  KeepAlive    = orddict:fetch(keep_alive,     Opts),
+  State = #state{ id             = Id
+                , min_size       = MinSize
+                , max_size       = MaxSize
+                , max_queue_size = MaxQueueSize
+                , opts           = Opts
+                , connections    = []
+                , monitors       = []
+                , waiting        = queue:new()
+                , timer          = maybe_close_unused_timer(Opts)
                 },
-  lager:debug( "erserve_pool | initialising pool, name ~p size ~p keep_alive ~p"
-             , [Id, Size, proplists:get_value(keep_alive, Opts)] ),
+  lager:debug( "erserve_pool | initialising pool, name ~p min size ~p "
+               "max size ~p max queue size ~p keep_alive ~p"
+             , [Id, MinSize, MaxSize, MaxQueueSize, KeepAlive] ),
+  %% Send message to self to begin initialising connections
+  gen_server:cast(self(), {start_connections, MinSize}),
   {ok, State}.
 
+-spec assert_config(options()) -> ok.
+assert_config(Opts) ->
+  MandatoryKeys = [min_size, max_size, max_queue_size, keep_alive],
+  lists:foreach(fun(Key) ->
+                    case orddict:find(Key, Opts) of
+                      {ok, _Value} -> ok;
+                      error        -> throw({missing_config_key, Key})
+                    end
+                end, MandatoryKeys),
+  ok.
+
 maybe_close_unused_timer(Opts) ->
-  case proplists:get_value(keep_alive, Opts) of
+  case orddict:fetch(keep_alive, Opts) of
     true ->
       undefined;
     _    ->
@@ -122,39 +155,66 @@ maybe_close_unused_timer(Opts) ->
       TRef
   end.
 
-%% Requestor wants a connection. When available then immediately return,
-%% otherwise add to the waiting queue.
-handle_call(get_connection, From, State=#state{ connections = Connections
-                                              , waiting = Waiting         }) ->
+%% Request for a connection. If one is available, return it. Otherwise, we may
+%% start a new request, and also may queue the requestor.
+handle_call(get_connection, From, State=#state{connections = Connections}) ->
+  NConnections = length(Connections),
   case Connections of
-    [ {Conn, _} | Rest] ->
+    [{Conn, _} | Rest] ->
       %% Return existing unused connection
+      lager:debug("erserve_pool | connection available"),
       {noreply, deliver(From, Conn, State#state{connections = Rest})};
-    []                  ->
-      case length(State#state.monitors) < State#state.size of
-        true  ->
-          %% Allocate a new connection and return it.
-          {ok, Conn} = connect(State#state.opts),
-          {noreply, deliver(From, Conn, State)};
-        false ->
-          %% Reached max connections, let the requestor wait
-          {noreply, State#state{waiting = queue:in(From, Waiting)}}
+    []                 ->
+      lager:debug("erserve_pool | no connection available"),
+      %% If there's room in the pool, trigger opening a new connection
+      case NConnections < State#state.max_size of
+        true  -> spawn_connect(State#state.opts);
+        false -> ok
+      end,
+      %% If there's room in the queue, let the requestor wait.
+      case maybe_queue(From, State) of
+        {queued,   NewState} ->
+          lager:debug("erserve_pool | queueing requestor"),
+          {noreply, NewState};
+        {rejected, NewState} ->
+          lager:debug("erserve_pool | rejecting connection request"),
+          {reply, error, NewState}
       end
   end;
-handle_call(get_pid, _From, State)                                           ->
+handle_call(get_pid, _From, State)                                         ->
   {reply, self(), State};
 %% Trap unsupported calls
-handle_call(Request, _From, State)                                           ->
+handle_call(Request, _From, State)                                         ->
   {stop, {unsupported_call, Request}, State}.
 
+-spec maybe_queue(term(), state()) -> {queued, state()} | {rejected, state()}.
+maybe_queue(From, State = #state{ waiting        = Waiting
+                                , max_queue_size = MaxSize }) ->
+  NWaiting = queue:len(Waiting),
+  case NWaiting < MaxSize of
+    true  -> {queued,   State#state{ waiting = queue:in(From, Waiting) }};
+    false -> {rejected, State}
+  end.
+
+%% Open a number of connections
+handle_cast({start_connections, N}, State=#state{opts = Opts})            ->
+  lager:debug("erserve_pool | starting ~p connections", [N]),
+  spawn_connect(Opts, N),
+  {noreply, State};
+%% New connection finished initialising and ready to be added to pool.
+handle_cast({new_connection, Conn}, State)                                ->
+  lager:debug("erserve_pool | new connection received, adding to pool"),
+  {noreply, return(Conn, State)};
 %% Connection returned from the requestor, back into our pool.
 %% Demonitor the requestor.
 handle_cast({return_connection, Conn}, State=#state{monitors = Monitors}) ->
+  lager:debug("erserve_pool | connection returned, adding to pool"),
   case lists:keytake(Conn, 1, Monitors) of
     {value, {Conn, Monitor}, Monitors2} ->
       erlang:demonitor(Monitor),
       {noreply, return(Conn, State#state{monitors = Monitors2})};
     false                               ->
+      lager:debug("erserve_pool | failed to demonitor on returned connection"),
       {noreply, State}
   end;
 %% Requestor gave up (timeout), remove from our waiting queue (if any).
@@ -196,17 +256,17 @@ handle_info({'DOWN', Monitor, process, _Pid, _Info},
 %% Connection closed; perform cleanup of monitoring
 handle_info({'EXIT', ConnectionPid, _Reason}, State) ->
   lager:debug("erserve_pool | connection closed, clean up monitoring"),
-  #state{ connections = Connections
-        , monitors    = Monitors} = State,
-  Connections2 = proplists:delete(ConnectionPid, Connections),
-  F = fun({Conn, Monitor}) when Conn == ConnectionPid ->
+  #state{ connections = Connections0
+        , monitors    = Monitors0} = State,
+  Connections = proplists:delete(ConnectionPid, Connections0),
+  F = fun({{Pid, _Time}, Monitor}) when Pid == ConnectionPid ->
           erlang:demonitor(Monitor),
           false;
-         ({_Conn, _Monitor})                          ->
+         ({_Conn, _Monitor})                                 ->
           true
       end,
-  Monitors2 = lists:filter(F, Monitors),
-  {noreply, State#state{connections = Connections2, monitors = Monitors2}};
+  Monitors = lists:filter(F, Monitors0),
+  {noreply, State#state{connections = Connections, monitors = Monitors}};
 %% Trap unsupported info calls.
 handle_info(Info, State)                             ->
   {stop, {unsupported_info, Info}, State}.
@@ -224,10 +284,32 @@ code_change(_OldVsn, State, _Extra) ->
 
 
 %%%_* Internal functions -------------------------------------------------------
+-spec spawn_connect(options()) -> ok.
+spawn_connect(Opts) ->
+  spawn_connect(Opts, 1).
+
+-spec spawn_connect(options(), pos_integer()) -> ok.
+spawn_connect(_Opts, 0)                           -> ok;
+spawn_connect( Opts, N) when is_integer(N), N > 0 ->
+  PoolPid = self(),
+  F       = fun() ->
+                {ok, Conn} = connect(Opts),
+                erserve:controlling_process(Conn, PoolPid),
+                gen_server:cast(PoolPid, {new_connection, Conn})
+            end,
+  proc_lib:spawn(F),
+  spawn_connect(Opts, N-1).
+
 connect(Opts) ->
   lager:debug("erserve_pool | initialising new worker"),
-  Host = proplists:get_value(host, Opts),
-  Port = proplists:get_value(port, Opts),
+  Host = case orddict:find(host, Opts) of
+           {ok, Host0} -> Host0;
+           error       -> undefined
+         end,
+  Port = case orddict:find(port, Opts) of
+           {ok, Port0} -> Port0;
+           error       -> undefined
+         end,
   Conn = case {Host, Port} of
            {undefined, undefined} -> erserve:open();
            {_SomeHost, undefined} -> erserve:open(Host);
@@ -243,17 +325,17 @@ connect(Opts) ->
   end.
 
 run_init_commands(Conn, Opts) ->
-  case proplists:get_value(init_commands, Opts) of
-    undefined ->
-      ok;
-    []        ->
-      ok;
-    Commands  ->
+  case orddict:find(init_commands, Opts) of
+    error          -> ok;
+    {ok, []}       -> ok;
+    {ok, Commands} ->
       try
+        lager:debug( "erserve_pool | running ~p init commands",
+                     [length(Commands)] ),
         lists:foreach(fun(Cmd) ->
                           ok = erserve:eval_void(Conn, Cmd)
                       end, Commands),
-        ok
+        ok = erserve:eval_void(Conn, "1")
       catch
         _:Error ->
           {error, init_commands, Error}
@@ -261,12 +343,12 @@ run_init_commands(Conn, Opts) ->
   end.
 
 deliver(From={Pid, _Tag}, Conn, State=#state{monitors=Monitors}) ->
-  Monitor  = erlang:monitor(process, Pid),
+  Monitor = erlang:monitor(process, Pid),
   gen_server:reply(From, {ok, Conn}),
   State#state{monitors = [ {Conn, Monitor} | Monitors ]}.
 
 return(Conn, State=#state{ connections = Connections
-                         , waiting     = Waiting     }) ->
+                         , waiting     = Waiting }) ->
   case queue:out(Waiting) of
     { {value, From}, Waiting2 } ->
       State2 = deliver(From, Conn, State),
@@ -278,6 +360,7 @@ return(Conn, State=#state{ connections = Connections
 
 
 %% Return the current time in seconds, used for timeouts.
+-spec now_secs() -> seconds().
 now_secs() ->
   {MegaSecs, Secs, _MilliSecs} = erlang:now(),
   MegaSecs * 1000 + Secs.

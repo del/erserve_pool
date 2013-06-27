@@ -12,7 +12,7 @@
 -export([ get_connection/1
         , get_connection/2
         , return_connection/2
-        , start_pool/3
+        , start_pool/2
         , stop_pool/1
         ]).
 
@@ -24,7 +24,7 @@
 
 %%%_* Types --------------------------------------------------------------------
 -type name()      :: atom() | string().
--type pool_opts() :: [ {atom(), term()} ].
+-type pool_opts() :: [ proplists:property() ].
 
 -export_type([ name/0
              , pool_opts/0
@@ -36,14 +36,15 @@
 %%%-----------------------------------------------------------------------------
 %%% @doc Get a connection, waiting at most 10 seconds before giving up.
 %%%-----------------------------------------------------------------------------
--spec get_connection(name()) -> erserve:connection().
+-spec get_connection(name()) -> {ok, erserve:connection()} | error.
 get_connection(Pool) ->
   erserve_pool_worker:get_connection(Pool).
 
 %%%-----------------------------------------------------------------------------
 %%% @doc Get a connection, waiting at most Timeout seconds before giving up.
 %%%-----------------------------------------------------------------------------
--spec get_connection(name(), pos_integer()) -> erserve:connection().
+-spec get_connection(name(), pos_integer()) -> {ok, erserve:connection()}
+                                             | error.
 get_connection(Pool, Timeout) ->
   erserve_pool_worker:get_connection(Pool, Timeout).
 
@@ -63,15 +64,16 @@ stop_pool(Pool) ->
   supervisor:terminate_child(erserve_pool_sup, Pid).
 
 %%%-----------------------------------------------------------------------------
-%%% @doc Start a pool called Name, with a maximum of Size connections.
-%%%      Opts is a proplist that can contain the keys host and port, giving the
-%%%      hostname and port to use, respectively. If port or both is empty, the
+%%% @doc Start a pool called Name. Opts is a proplist that contains the pool
+%%%      configuration keys min_size, max_size, max_queue_size and keep_alive,
+%%%      and optionally, the keys host and port, giving the hostname and port
+%%%      to use with Rserve, respectively. If port or both is empty, the
 %%%      defaults from erserve ("localhost", 6311) are used.
 %%%-----------------------------------------------------------------------------
--spec start_pool(string(), pos_integer(), pool_opts()) ->
-                    {ok, pid()} | {error, term()}.
-start_pool(Name, Size, Opts) ->
-  supervisor:start_child(erserve_pool_sup, [Name, Size, Opts]).
+-spec start_pool(name(), pool_opts()) -> {ok, pid()} | {error, term()}.
+start_pool(Name, Opts0) ->
+  Opts = orddict:from_list(Opts0),
+  supervisor:start_child(erserve_pool_sup, [Name, Opts]).
 
 
 %%%_* application callbacks ----------------------------------------------------
