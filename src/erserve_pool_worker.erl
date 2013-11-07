@@ -157,8 +157,8 @@ maybe_close_unused_timer(Opts) ->
 
 %% Request for a connection. If one is available, return it. Otherwise, we may
 %% start a new request, and also may queue the requestor.
-handle_call(get_connection, From, State=#state{connections = Connections}) ->
-  NConnections = length(Connections),
+handle_call(get_connection, From, State=#state{ connections = Connections
+                                              , monitors    = Monitors }) ->
   case Connections of
     [{Conn, _} | Rest] ->
       %% Return existing unused connection
@@ -167,6 +167,7 @@ handle_call(get_connection, From, State=#state{connections = Connections}) ->
     []                 ->
       lager:debug("erserve_pool | no connection available"),
       %% If there's room in the pool, trigger opening a new connection
+      NConnections = length(Monitors),
       case NConnections < State#state.max_size of
         true  -> spawn_connect(State#state.opts);
         false -> ok
