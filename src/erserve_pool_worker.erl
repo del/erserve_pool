@@ -36,6 +36,7 @@
                , max_queue_size :: pos_integer() | inf
                , connections    :: [ tagged_connection() ]
                , monitors       :: [ {tagged_connection(), reference()} ]
+               , pending_conn   :: non_neg_integer()
                , waiting        :: [ pid() ]
                , opts           :: options()
                , timer          :: timer:tref()
@@ -125,6 +126,7 @@ init({Name, Opts}) ->
                 , opts           = Opts
                 , connections    = []
                 , monitors       = []
+                , pending_conn   = 0
                 , waiting        = queue:new()
                 , timer          = maybe_close_unused_timer(Opts)
                 },
@@ -157,8 +159,9 @@ maybe_close_unused_timer(Opts) ->
 
 %% Request for a connection. If one is available, return it. Otherwise, we may
 %% start a new request, and also may queue the requestor.
-handle_call(get_connection, From, State=#state{ connections = Connections
-                                              , monitors    = Monitors }) ->
+handle_call(get_connection, From, State=#state{ connections  = Connections
+                                              , monitors     = Monitors
+                                              , pending_conn = Pending }) ->
   case Connections of
     [{Conn, _} | Rest] ->
       %% Return existing unused connection
@@ -167,13 +170,14 @@ handle_call(get_connection, From, State=#state{ connections = Connections
     []                 ->
       lager:debug("erserve_pool | no connection available"),
       %% If there's room in the pool, trigger opening a new connection
-      NConnections = length(Monitors),
-      case NConnections < State#state.max_size of
-        true  -> spawn_connect(State#state.opts);
-        false -> ok
-      end,
+      NConnections = length(Monitors) + Pending,
+      State2 =
+        case NConnections < State#state.max_size of
+          true  -> spawn_connect(State);
+          false -> State
+        end,
       %% If there's room in the queue, let the requestor wait.
-      case maybe_queue(From, State) of
+      case maybe_queue(From, State2) of
         {queued,   NewState} ->
           lager:debug("erserve_pool | queueing requestor"),
           {noreply, NewState};
@@ -198,14 +202,13 @@ maybe_queue(From, State = #state{ waiting        = Waiting
   end.
 
 %% Open a number of connections
-handle_cast({start_connections, N}, State=#state{opts = Opts})            ->
+handle_cast({start_connections, N}, State)                                ->
   lager:debug("erserve_pool | starting ~p connections", [N]),
-  spawn_connect(Opts, N),
-  {noreply, State};
+  {noreply, spawn_connect(State, N)};
 %% New connection finished initialising and ready to be added to pool.
 handle_cast({new_connection, Conn}, State)                                ->
   lager:debug("erserve_pool | new connection received, adding to pool"),
-  {noreply, return(Conn, State)};
+  {noreply, return(Conn, dcr_pending_conn(State))};
 %% Connection returned from the requestor, back into our pool.
 %% Demonitor the requestor.
 handle_cast({return_connection, Conn}, State=#state{monitors = Monitors}) ->
@@ -285,21 +288,21 @@ code_change(_OldVsn, State, _Extra) ->
 
 
 %%%_* Internal functions -------------------------------------------------------
--spec spawn_connect(options()) -> ok.
-spawn_connect(Opts) ->
-  spawn_connect(Opts, 1).
+-spec spawn_connect(state()) -> ok.
+spawn_connect(State) ->
+  spawn_connect(State, 1).
 
--spec spawn_connect(options(), pos_integer()) -> ok.
-spawn_connect(_Opts, 0)                           -> ok;
-spawn_connect( Opts, N) when is_integer(N), N > 0 ->
+-spec spawn_connect(state(), pos_integer()) -> state().
+spawn_connect(State, 0)                           -> State;
+spawn_connect(State, N) when is_integer(N), N > 0 ->
   PoolPid = self(),
   F       = fun() ->
-                {ok, Conn} = connect(Opts),
+                {ok, Conn} = connect(State#state.opts),
                 erserve:controlling_process(Conn, PoolPid),
                 gen_server:cast(PoolPid, {new_connection, Conn})
             end,
   proc_lib:spawn(F),
-  spawn_connect(Opts, N-1).
+  spawn_connect(inc_pending_conn(State), N-1).
 
 connect(Opts) ->
   lager:debug("erserve_pool | initialising new worker"),
@@ -359,6 +362,11 @@ return(Conn, State=#state{ connections = Connections
       State#state{connections = Connections2}
   end.
 
+inc_pending_conn(State = #state{pending_conn = Pending}) when Pending >= 0 ->
+  State#state{pending_conn = Pending + 1}.
+
+dcr_pending_conn(State = #state{pending_conn = Pending}) when Pending > 0 ->
+  State#state{pending_conn = Pending - 1}.
 
 %% Return the current time in seconds, used for timeouts.
 -spec now_secs() -> seconds().
